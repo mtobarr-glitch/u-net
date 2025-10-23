@@ -1,10 +1,14 @@
 __all__: list[str] = []
 
-# Enumerations
-TYPE_BS_MOG2: int
-TYPE_BS_KNN: int
-BackgroundSubtractorType = int
-"""One of [TYPE_BS_MOG2, TYPE_BS_KNN]"""
+# Functions
+def getIppVersion() -> str: ...
 
+def setUseIPP(flag: bool) -> None: ...
+
+def setUseIPP_NotExact(flag: bool) -> None: ...
+
+def useIPP() -> bool: ...
+
+def useIPP_NotExact() -> bool: ...
 
 

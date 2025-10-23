@@ -1,49 +1,71 @@
-# Copyright Jonathan Hartley 2013. BSD 3-Clause license, see LICENSE file.
-from contextlib import contextmanager
-from io import StringIO
-import sys
-import os
+# -*- coding: utf-8 -*-
+"""
+This module offers general convenience and utility functions for dealing with
+datetimes.
+
+.. versionadded:: 2.7.0
+"""
+from __future__ import unicode_literals
+
+from datetime import datetime, time
 
 
-class StreamTTY(StringIO):
-    def isatty(self):
-        return True
+def today(tzinfo=None):
+    """
+    Returns a :py:class:`datetime` representing the current day at midnight
 
-class StreamNonTTY(StringIO):
-    def isatty(self):
-        return False
+    :param tzinfo:
+        The time zone to attach (also used to determine the current day).
 
-@contextmanager
-def osname(name):
-    orig = os.name
-    os.name = name
-    yield
-    os.name = orig
+    :return:
+        A :py:class:`datetime.datetime` object representing the current day
+        at midnight.
+    """
 
-@contextmanager
-def replace_by(stream):
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    sys.stdout = stream
-    sys.stderr = stream
-    yield
-    sys.stdout = orig_stdout
-    sys.stderr = orig_stderr
+    dt = datetime.now(tzinfo)
+    return datetime.combine(dt.date(), time(0, tzinfo=tzinfo))
 
-@contextmanager
-def replace_original_by(stream):
-    orig_stdout = sys.__stdout__
-    orig_stderr = sys.__stderr__
-    sys.__stdout__ = stream
-    sys.__stderr__ = stream
-    yield
-    sys.__stdout__ = orig_stdout
-    sys.__stderr__ = orig_stderr
 
-@contextmanager
-def pycharm():
-    os.environ["PYCHARM_HOSTED"] = "1"
-    non_tty = StreamNonTTY()
-    with replace_by(non_tty), replace_original_by(non_tty):
-        yield
-    del os.environ["PYCHARM_HOSTED"]
+def default_tzinfo(dt, tzinfo):
+    """
+    Sets the ``tzinfo`` parameter on naive datetimes only
+
+    This is useful for example when you are provided a datetime that may have
+    either an implicit or explicit time zone, such as when parsing a time zone
+    string.
+
+    .. doctest::
+
+        >>> from dateutil.tz import tzoffset
+        >>> from dateutil.parser import parse
+        >>> from dateutil.utils import default_tzinfo
+        >>> dflt_tz = tzoffset("EST", -18000)
+        >>> print(default_tzinfo(parse('2014-01-01 12:30 UTC'), dflt_tz))
+        2014-01-01 12:30:00+00:00
+        >>> print(default_tzinfo(parse('2014-01-01 12:30'), dflt_tz))
+        2014-01-01 12:30:00-05:00
+
+    :param dt:
+        The datetime on which to replace the time zone
+
+    :param tzinfo:
+        The :py:class:`datetime.tzinfo` subclass instance to assign to
+        ``dt`` if (and only if) it is naive.
+
+    :return:
+        Returns an aware :py:class:`datetime.datetime`.
+    """
+    if dt.tzinfo is not None:
+        return dt
+    else:
+        return dt.replace(tzinfo=tzinfo)
+
+
+def within_delta(dt1, dt2, delta):
+    """
+    Useful for comparing two datetimes that may have a negligible difference
+    to be considered equal.
+    """
+    delta = abs(delta)
+    difference = dt1 - dt2
+    return -delta <= difference <= delta
