@@ -1,249 +1,605 @@
-"""Module containing utility functions for augmentation operations.
+"""Module containing utility functions and classes for the core Albumentations framework.
 
-This module provides a collection of helper functions and utilities used throughout
-the augmentation pipeline. It includes functions for image loading, type checking,
-error handling, mathematical operations, and decorators that add functionality to
-other functions in the codebase. These utilities help ensure consistent behavior
-and simplify common operations across different augmentation transforms.
+This module provides a collection of helper functions and base classes used throughout
+the Albumentations library. It includes utilities for shape handling, parameter processing,
+data conversion, and serialization. The module defines abstract base classes for data
+processors that implement the conversion logic between different data formats used in
+the transformation pipeline.
 """
 
 from __future__ import annotations
 
-import functools
-from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from numbers import Real
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
-import cv2
 import numpy as np
-from albucore.utils import (
-    is_grayscale_image,
-    is_multispectral_image,
-    is_rgb_image,
-)
-from typing_extensions import Concatenate, ParamSpec
 
-from albumentations.core.keypoints_utils import angle_to_2pi_range
+from albumentations.core.label_manager import LabelManager
+
+from .serialization import Serializable
+from .type_definitions import PAIR, Number
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import torch
+
+ShapeType = dict[Literal["depth", "height", "width"], int]
 
 
-__all__ = [
-    "angle_2pi_range",
-    "non_rgb_error",
-    "read_bgr_image",
-    "read_grayscale",
-    "read_rgb_image",
-]
-
-P = ParamSpec("P")
-T = TypeVar("T", bound=np.ndarray)
-F = TypeVar("F", bound=Callable[..., Any])
-
-
-def read_bgr_image(path: str | Path) -> np.ndarray:
-    """Read an image in BGR format from the specified path.
+def get_image_shape(img: np.ndarray | torch.Tensor) -> tuple[int, int]:
+    """Extract height and width dimensions from an image.
 
     Args:
-        path (str | Path): Path to the image file.
+        img (np.ndarray | torch.Tensor): Image as either numpy array (HWC format)
+            or torch tensor (CHW format).
 
     Returns:
-        np.ndarray: Image in BGR format as a numpy array.
-
-    """
-    return cv2.imread(str(path), cv2.IMREAD_COLOR)
-
-
-def read_rgb_image(path: str | Path) -> np.ndarray:
-    """Read an image in RGB format from the specified path.
-
-    This function reads an image in BGR format using OpenCV and then
-    converts it to RGB format.
-
-    Args:
-        path (str | Path): Path to the image file.
-
-    Returns:
-        np.ndarray: Image in RGB format as a numpy array.
-
-    """
-    image = read_bgr_image(path)
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-
-def read_grayscale(path: str | Path) -> np.ndarray:
-    """Read a grayscale image from the specified path.
-
-    Args:
-        path (str | Path): Path to the image file.
-
-    Returns:
-        np.ndarray: Grayscale image as a numpy array.
-
-    """
-    return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-
-
-def angle_2pi_range(
-    func: Callable[Concatenate[np.ndarray, P], np.ndarray],
-) -> Callable[Concatenate[np.ndarray, P], np.ndarray]:
-    """Decorator to normalize angle values to the range [0, 2π).
-
-    This decorator wraps a function that processes keypoints, ensuring that
-    angle values (stored in the 4th column, index 3) are normalized to the
-    range [0, 2π) after the wrapped function executes.
-
-    Args:
-        func (Callable): Function that processes keypoints and returns a numpy array.
-            The function should take a keypoints array as its first parameter.
-
-    Returns:
-        Callable: Wrapped function that normalizes angles after processing keypoints.
-
-    """
-
-    @wraps(func)
-    def wrapped_function(keypoints: np.ndarray, *args: P.args, **kwargs: P.kwargs) -> np.ndarray:
-        result = func(keypoints, *args, **kwargs)
-        if len(result) > 0 and result.shape[1] > 3:
-            result[:, 3] = angle_to_2pi_range(result[:, 3])
-        return result
-
-    return wrapped_function
-
-
-def non_rgb_error(image: np.ndarray) -> None:
-    """Check if the input image is RGB and raise a ValueError if it's not.
-
-    This function is used to ensure that certain transformations are only applied to
-    RGB images. It provides helpful error messages for grayscale and multi-spectral images.
-
-    Args:
-        image (np.ndarray): The input image to check. Expected to be a numpy array
-                            representing an image.
+        tuple[int, int]: Image dimensions as (height, width).
 
     Raises:
-        ValueError: If the input image is not an RGB image (i.e., does not have exactly 3 channels).
-                    The error message includes specific instructions for grayscale images
-                    and a note about incompatibility with multi-spectral images.
-
-    Note:
-        - RGB images are expected to have exactly 3 channels.
-        - Grayscale images (1 channel) will trigger an error with conversion instructions.
-        - Multi-spectral images (more than 3 channels) will trigger an error stating incompatibility.
-
-    Example:
-        >>> import numpy as np
-        >>> rgb_image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
-        >>> non_rgb_error(rgb_image)  # No error raised
-        >>>
-        >>> grayscale_image = np.random.randint(0, 256, (100, 100), dtype=np.uint8)
-        >>> non_rgb_error(grayscale_image)  # Raises ValueError with conversion instructions
-        >>>
-        >>> multispectral_image = np.random.randint(0, 256, (100, 100, 5), dtype=np.uint8)
-        >>> non_rgb_error(multispectral_image)  # Raises ValueError stating incompatibility
+        RuntimeError: If the image type is not supported.
 
     """
-    if not is_rgb_image(image):
-        message = "This transformation expects 3-channel images"
-        if is_grayscale_image(image):
-            message += "\nYou can convert your grayscale image to RGB using cv2.cvtColor(image, cv2.COLOR_GRAY2RGB))"
-        if is_multispectral_image(image):  # Any image with a number of channels other than 1 and 3
-            message += "\nThis transformation cannot be applied to multi-spectral images"
+    if isinstance(img, np.ndarray):
+        return img.shape[:2]  # HWC format
+    try:
+        import torch
 
-        raise ValueError(message)
+        if torch.is_tensor(img):
+            return img.shape[-2:]  # CHW format
+    except ImportError:
+        pass
+    raise RuntimeError(f"Unsupported image type: {type(img)}")
 
 
-def check_range(value: tuple[float, float], lower_bound: float, upper_bound: float, name: str | None) -> None:
-    """Checks if the given value is within the specified bounds
+def get_volume_shape(vol: np.ndarray | torch.Tensor) -> tuple[int, int, int]:
+    """Extract depth, height, and width dimensions from a volume.
 
     Args:
-        value (tuple[float, float]): The value to check and convert. Can be a single float or a tuple of floats.
-        lower_bound (float): The lower bound for the range check.
-        upper_bound (float): The upper bound for the range check.
-        name (str | None): The name of the parameter being checked. Used for error messages.
+        vol (np.ndarray | torch.Tensor): Volume as either numpy array (DHWC format)
+            or torch tensor (CDHW format).
+
+    Returns:
+        tuple[int, int, int]: Volume dimensions as (depth, height, width).
 
     Raises:
-        ValueError: If the value is outside the bounds or if the tuple values are not ordered correctly.
+        RuntimeError: If the volume type is not supported.
 
     """
-    if not all(lower_bound <= x <= upper_bound for x in value):
-        raise ValueError(f"All values in {name} must be within [{lower_bound}, {upper_bound}] for tuple inputs.")
-    if not value[0] <= value[1]:
-        raise ValueError(f"{name!s} tuple values must be ordered as (min, max). Got: {value}")
+    if isinstance(vol, np.ndarray):
+        return vol.shape[:3]  # DHWC format
+    try:
+        import torch
+
+        if torch.is_tensor(vol):
+            return vol.shape[-3:]  # CDHW format
+    except ImportError:
+        pass
+    raise RuntimeError(f"Unsupported volume type: {type(vol)}")
 
 
-class PCA:
-    def __init__(self, n_components: int | None = None) -> None:
-        if n_components is not None and n_components <= 0:
-            raise ValueError("Number of components must be greater than zero.")
-        self.n_components = n_components
-        self.mean: np.ndarray | None = None
-        self.components_: np.ndarray | None = None
-        self.explained_variance_: np.ndarray | None = None
+def get_shape(data: dict[str, Any]) -> ShapeType:
+    """Extract spatial dimensions from input data dictionary containing image or volume.
 
-    def fit(self, x: np.ndarray) -> None:
-        x = x.astype(np.float64, copy=False)  # avoid unnecessary copy if already float64
-        n_samples, n_features = x.shape
+    Args:
+        data (dict[str, Any]): Dictionary containing image or volume data with one of:
+            - 'volume': 3D array of shape (D, H, W, C) [numpy] or (C, D, H, W) [torch]
+            - 'image': 2D array of shape (H, W, C) [numpy] or (C, H, W) [torch]
+            - 'images': Batch of arrays of shape (N, H, W, C) [numpy] or (N, C, H, W) [torch]
 
-        # Determine the number of components if not set
-        if self.n_components is None:
-            self.n_components = min(n_samples, n_features)
+    Returns:
+        dict[Literal["depth", "height", "width"], int]: Dictionary containing spatial dimensions
 
-        self.mean, eigenvectors, eigenvalues = cv2.PCACompute2(x, mean=None, maxComponents=self.n_components)
-        self.components_ = eigenvectors
-        self.explained_variance_ = eigenvalues.flatten()
-
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        if self.components_ is None:
-            raise ValueError(
-                "This PCA instance is not fitted yet. "
-                "Call 'fit' with appropriate arguments before using this estimator.",
-            )
-        x = x.astype(np.float64, copy=False)  # avoid unnecessary copy if already float64
-        return cv2.PCAProject(x, self.mean, self.components_)
-
-    def fit_transform(self, x: np.ndarray) -> np.ndarray:
-        self.fit(x)
-        return self.transform(x)
-
-    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
-        if self.components_ is None:
-            raise ValueError(
-                "This PCA instance is not fitted yet. "
-                "Call 'fit' with appropriate arguments before using this estimator.",
-            )
-        return cv2.PCABackProject(x, self.mean, self.components_)
-
-    def explained_variance_ratio(self) -> np.ndarray:
-        if self.explained_variance_ is None:
-            raise ValueError(
-                "This PCA instance is not fitted yet. Call 'fit' with appropriate arguments before using this method.",
-            )
-        total_variance = np.sum(self.explained_variance_)
-        return self.explained_variance_ / total_variance
-
-    def cumulative_explained_variance_ratio(self) -> np.ndarray:
-        return np.cumsum(self.explained_variance_ratio())
+    """
+    if "volume" in data:
+        depth, height, width = get_volume_shape(data["volume"])
+        return {"depth": depth, "height": height, "width": width}
+    if "image" in data:
+        height, width = get_image_shape(data["image"])
+        return {"height": height, "width": width}
+    if "images" in data:
+        height, width = get_image_shape(data["images"][0])
+        return {"height": height, "width": width}
+    raise ValueError("No image or volume found in data", data.keys())
 
 
-def handle_empty_array(param_name: str) -> Callable[[F], F]:
-    def decorator(func: F) -> F:
-        @functools.wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            # Check if the parameter is passed as positional argument
-            if len(args) > 0:
-                array = args[0]
-            # Check if the parameter is passed as keyword argument
-            elif param_name in kwargs:
-                array = kwargs[param_name]
+def format_args(args_dict: dict[str, Any]) -> str:
+    """Format a dictionary of arguments into a string representation.
+
+    Args:
+        args_dict (dict[str, Any]): Dictionary of argument names and values.
+
+    Returns:
+        str: Formatted string of arguments in the form "key1='value1', key2=value2".
+
+    """
+    formatted_args = []
+    for k, v in args_dict.items():
+        v_formatted = f"'{v}'" if isinstance(v, str) else str(v)
+        formatted_args.append(f"{k}={v_formatted}")
+    return ", ".join(formatted_args)
+
+
+class Params(Serializable, ABC):
+    """Base class for parameter handling in transforms.
+
+    Args:
+        format (Any): The format of the data this parameter object will process.
+        label_fields (Sequence[str] | None): List of fields that are joined with the data, such as labels.
+
+    """
+
+    def __init__(self, format: Any, label_fields: Sequence[str] | None):  # noqa: A002
+        self.format = format
+        self.label_fields = label_fields
+
+    def to_dict_private(self) -> dict[str, Any]:
+        """Return a dictionary containing the private parameters of this object.
+
+        Returns:
+            dict[str, Any]: Dictionary with format and label_fields parameters.
+
+        """
+        return {"format": self.format, "label_fields": self.label_fields}
+
+
+class DataProcessor(ABC):
+    """Abstract base class for data processors.
+
+    Data processors handle the conversion, validation, and filtering of data
+    during transformations.
+
+    Args:
+        params (Params): Parameters for data processing.
+        additional_targets (dict[str, str] | None): Dictionary mapping additional target names to their types.
+
+    """
+
+    def __init__(self, params: Params, additional_targets: dict[str, str] | None = None):
+        self.params = params
+        self.data_fields = [self.default_data_name]
+        self.is_sequence_input: dict[str, bool] = {}
+        self.label_manager = LabelManager()
+
+        if additional_targets is not None:
+            self.add_targets(additional_targets)
+
+    @property
+    @abstractmethod
+    def default_data_name(self) -> str:
+        """Return the default name of the data field.
+
+        Returns:
+            str: Default data field name.
+
+        """
+        raise NotImplementedError
+
+    def add_targets(self, additional_targets: dict[str, str]) -> None:
+        """Add targets to transform them the same way as one of existing targets."""
+        for k, v in additional_targets.items():
+            if v == self.default_data_name and k not in self.data_fields:
+                self.data_fields.append(k)
+
+    def ensure_data_valid(self, data: dict[str, Any]) -> None:
+        """Validate input data before processing.
+
+        Args:
+            data (dict[str, Any]): Input data dictionary to validate.
+
+        """
+
+    def ensure_transforms_valid(self, transforms: Sequence[object]) -> None:
+        """Validate transforms before applying them.
+
+        Args:
+            transforms (Sequence[object]): Sequence of transforms to validate.
+
+        """
+
+    def postprocess(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Process data after transformation.
+
+        Args:
+            data (dict[str, Any]): Data dictionary after transformation.
+
+        Returns:
+            dict[str, Any]: Processed data dictionary.
+
+        """
+        shape = get_shape(data)
+        data = self._process_data_fields(data, shape)
+        data = self.remove_label_fields_from_data(data)
+        return self._convert_sequence_inputs(data)
+
+    def _process_data_fields(self, data: dict[str, Any], shape: ShapeType) -> dict[str, Any]:
+        for data_name in set(self.data_fields) & set(data.keys()):
+            data[data_name] = self._process_single_field(data_name, data[data_name], shape)
+        return data
+
+    def _process_single_field(self, data_name: str, field_data: Any, shape: ShapeType) -> Any:
+        field_data = self.filter(field_data, shape)
+
+        if data_name == "keypoints" and len(field_data) == 0:
+            field_data = self._create_empty_keypoints_array()
+
+        return self.check_and_convert(field_data, shape, direction="from")
+
+    def _create_empty_keypoints_array(self) -> np.ndarray:
+        return np.array([], dtype=np.float32).reshape(0, len(self.params.format))
+
+    def _convert_sequence_inputs(self, data: dict[str, Any]) -> dict[str, Any]:
+        for data_name in set(self.data_fields) & set(data.keys()):
+            if self.is_sequence_input.get(data_name, False):
+                data[data_name] = data[data_name].tolist()
+        return data
+
+    def preprocess(self, data: dict[str, Any]) -> None:
+        """Process data before transformation.
+
+        Args:
+            data (dict[str, Any]): Data dictionary to preprocess.
+
+        """
+        shape = get_shape(data)
+
+        for data_name in set(self.data_fields) & set(data.keys()):  # Convert list of lists to numpy array if necessary
+            if isinstance(data[data_name], Sequence):
+                self.is_sequence_input[data_name] = True
+                data[data_name] = np.array(data[data_name], dtype=np.float32)
             else:
-                raise ValueError(f"Missing required argument: {param_name}")
+                self.is_sequence_input[data_name] = False
 
-            if len(array) == 0:
-                return array
-            return func(*args, **kwargs)
+        data = self.add_label_fields_to_data(data)
+        for data_name in set(self.data_fields) & set(data.keys()):
+            data[data_name] = self.check_and_convert(data[data_name], shape, direction="to")
 
-        return cast("F", wrapper)
+    def check_and_convert(
+        self,
+        data: np.ndarray,
+        shape: ShapeType,
+        direction: Literal["to", "from"] = "to",
+    ) -> np.ndarray:
+        """Check and convert data between Albumentations and external formats.
 
-    return decorator
+        Args:
+            data (np.ndarray): Input data array.
+            shape (ShapeType): Shape information containing dimensions.
+            direction (Literal["to", "from"], optional): Conversion direction.
+                "to" converts to Albumentations format, "from" converts from it.
+                Defaults to "to".
+
+        Returns:
+            np.ndarray: Converted data array.
+
+        """
+        if self.params.format == "albumentations":
+            self.check(data, shape)
+            return data
+
+        process_func = self.convert_to_albumentations if direction == "to" else self.convert_from_albumentations
+
+        return process_func(data, shape)
+
+    @abstractmethod
+    def filter(self, data: np.ndarray, shape: ShapeType) -> np.ndarray:
+        """Filter data based on shapes.
+
+        Args:
+            data (np.ndarray): Data to filter.
+            shape (ShapeType): Shape information containing dimensions.
+
+        Returns:
+            np.ndarray: Filtered data.
+
+        """
+
+    @abstractmethod
+    def check(self, data: np.ndarray, shape: ShapeType) -> None:
+        """Validate data structure against shape requirements.
+
+        Args:
+            data (np.ndarray): Data to validate.
+            shape (ShapeType): Shape information containing dimensions.
+
+        """
+
+    @abstractmethod
+    def convert_to_albumentations(
+        self,
+        data: np.ndarray,
+        shape: ShapeType,
+    ) -> np.ndarray:
+        """Convert data from external format to Albumentations internal format.
+
+        Args:
+            data (np.ndarray): Data in external format.
+            shape (ShapeType): Shape information containing dimensions.
+
+        Returns:
+            np.ndarray: Data in Albumentations format.
+
+        """
+
+    @abstractmethod
+    def convert_from_albumentations(
+        self,
+        data: np.ndarray,
+        shape: ShapeType,
+    ) -> np.ndarray:
+        """Convert data from Albumentations internal format to external format.
+
+        Args:
+            data (np.ndarray): Data in Albumentations format.
+            shape (ShapeType): Shape information containing dimensions.
+
+        Returns:
+            np.ndarray: Data in external format.
+
+        """
+
+    def add_label_fields_to_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Add label fields to data arrays.
+
+        This method processes label fields and joins them with the corresponding data arrays.
+
+        Args:
+            data (dict[str, Any]): Input data dictionary.
+
+        Returns:
+            dict[str, Any]: Data with label fields added.
+
+        """
+        if not self.params.label_fields:
+            return data
+
+        for data_name in set(self.data_fields) & set(data.keys()):
+            if not data[data_name].size:
+                continue
+            data[data_name] = self._process_label_fields(data, data_name)
+
+        return data
+
+    def _process_label_fields(self, data: dict[str, Any], data_name: str) -> np.ndarray:
+        data_array = data[data_name]
+        if self.params.label_fields is not None:
+            for label_field in self.params.label_fields:
+                self._validate_label_field_length(data, data_name, label_field)
+                encoded_labels = self.label_manager.process_field(data_name, label_field, data[label_field])
+                data_array = np.hstack((data_array, encoded_labels))
+                del data[label_field]
+        return data_array
+
+    def _validate_label_field_length(self, data: dict[str, Any], data_name: str, label_field: str) -> None:
+        if len(data[data_name]) != len(data[label_field]):
+            raise ValueError(
+                f"The lengths of {data_name} and {label_field} do not match. "
+                f"Got {len(data[data_name])} and {len(data[label_field])} respectively.",
+            )
+
+    def remove_label_fields_from_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Remove label fields from data arrays and restore them as separate entries.
+
+        Args:
+            data (dict[str, Any]): Input data dictionary with combined label fields.
+
+        Returns:
+            dict[str, Any]: Data with label fields extracted as separate entries.
+
+        """
+        if not self.params.label_fields:
+            return data
+
+        for data_name in set(self.data_fields) & set(data.keys()):
+            if not data[data_name].size:
+                self._handle_empty_data_array(data)
+                continue
+            self._remove_label_fields(data, data_name)
+
+        return data
+
+    def _handle_empty_data_array(self, data: dict[str, Any]) -> None:
+        if self.params.label_fields is not None:
+            for label_field in self.params.label_fields:
+                data[label_field] = self.label_manager.handle_empty_data()
+
+    def _remove_label_fields(self, data: dict[str, Any], data_name: str) -> None:
+        if self.params.label_fields is None:
+            return
+
+        data_array = data[data_name]
+        num_label_fields = len(self.params.label_fields)
+        non_label_columns = data_array.shape[1] - num_label_fields
+
+        for idx, label_field in enumerate(self.params.label_fields):
+            encoded_labels = data_array[:, non_label_columns + idx]
+            data[label_field] = self.label_manager.restore_field(data_name, label_field, encoded_labels)
+
+        data[data_name] = data_array[:, :non_label_columns]
+
+
+def validate_args(
+    low: float | Sequence[int] | Sequence[float] | None,
+    bias: float | None,
+) -> None:
+    """Validate that 'low' and 'bias' parameters are not used together.
+
+    Args:
+        low (float | Sequence[int] | Sequence[float] | None): Lower bound value.
+        bias (float | None): Bias value to be added to both min and max values.
+
+    Raises:
+        ValueError: If both 'low' and 'bias' are provided.
+
+    """
+    if low is not None and bias is not None:
+        raise ValueError("Arguments 'low' and 'bias' cannot be used together.")
+
+
+def process_sequence(param: Sequence[Number]) -> tuple[Number, Number]:
+    """Process a sequence and return it as a (min, max) tuple.
+
+    Args:
+        param (Sequence[Number]): Sequence of numeric values.
+
+    Returns:
+        tuple[Number, Number]: Tuple containing (min_value, max_value) from the sequence.
+
+    Raises:
+        ValueError: If the sequence doesn't contain exactly 2 elements.
+
+    """
+    if len(param) != PAIR:
+        raise ValueError("Sequence must contain exactly 2 elements.")
+    return min(param), max(param)
+
+
+def process_scalar(param: Number, low: Number | None) -> tuple[Number, Number]:
+    """Process a scalar value and optional low bound into a (min, max) tuple.
+
+    Args:
+        param (Number): Scalar numeric value.
+        low (Number | None): Optional lower bound.
+
+    Returns:
+        tuple[Number, Number]: Tuple containing (min_value, max_value) where:
+            - If low is provided: (low, param) if low < param else (param, low)
+            - If low is None: (-param, param) creating a symmetric range around zero
+
+    """
+    if isinstance(low, Real):
+        return (low, param) if low < param else (param, low)
+    return -param, param
+
+
+def apply_bias(min_val: Number, max_val: Number, bias: Number) -> tuple[Number, Number]:
+    """Apply a bias to both values in a range.
+
+    Args:
+        min_val (Number): Minimum value.
+        max_val (Number): Maximum value.
+        bias (Number): Value to add to both min and max.
+
+    Returns:
+        tuple[Number, Number]: Tuple containing (min_val + bias, max_val + bias).
+
+    """
+    return bias + min_val, bias + max_val
+
+
+def ensure_int_output(
+    min_val: Number,
+    max_val: Number,
+    param: Number,
+) -> tuple[int, int] | tuple[float, float]:
+    """Ensure output is of the same type (int or float) as the input parameter.
+
+    Args:
+        min_val (Number): Minimum value.
+        max_val (Number): Maximum value.
+        param (Number): Original parameter used to determine the output type.
+
+    Returns:
+        tuple[int, int] | tuple[float, float]: Tuple with values converted to int if param is int,
+        otherwise values remain as float.
+
+    """
+    return (int(min_val), int(max_val)) if isinstance(param, int) else (float(min_val), float(max_val))
+
+
+def ensure_contiguous_output(arg: np.ndarray | Sequence[np.ndarray]) -> np.ndarray | list[np.ndarray]:
+    """Ensure that numpy arrays are contiguous in memory.
+
+    Args:
+        arg (np.ndarray | Sequence[np.ndarray]): A numpy array or sequence of numpy arrays.
+
+    Returns:
+        np.ndarray | list[np.ndarray]: Contiguous array(s) with the same data.
+
+    """
+    if isinstance(arg, np.ndarray):
+        arg = np.ascontiguousarray(arg)
+    elif isinstance(arg, Sequence):
+        arg = list(map(ensure_contiguous_output, arg))
+    return arg
+
+
+@overload
+def to_tuple(
+    param: int | tuple[int, int],
+    low: int | tuple[int, int] | None = None,
+    bias: float | None = None,
+) -> tuple[int, int]: ...
+
+
+@overload
+def to_tuple(
+    param: float | tuple[float, float],
+    low: float | tuple[float, float] | None = None,
+    bias: float | None = None,
+) -> tuple[float, float]: ...
+
+
+def to_tuple(
+    param: float | tuple[float, float] | tuple[int, int],
+    low: float | tuple[float, float] | tuple[int, int] | None = None,
+    bias: float | None = None,
+) -> tuple[float, float] | tuple[int, int]:
+    """Convert input argument to a min-max tuple.
+
+    This function processes various input types and returns a tuple representing a range.
+    It handles single values, sequences, and can apply optional low bounds or biases.
+
+    Args:
+        param (tuple[float, float] | float | tuple[int, int] | int): The primary input value. Can be:
+            - A single int or float: Converted to a symmetric range around zero.
+            - A tuple of two ints or two floats: Used directly as min and max values.
+
+        low (tuple[float, float] | float | None, optional): A lower bound value. Used when param is a single value.
+            If provided, the result will be (low, param) or (param, low), depending on which is smaller.
+            Cannot be used together with 'bias'. Defaults to None.
+
+        bias (float | int | None, optional): A value to be added to both elements of the resulting tuple.
+            Cannot be used together with 'low'. Defaults to None.
+
+    Returns:
+        tuple[int, int] | tuple[float, float]: A tuple representing the processed range.
+            - If input is int-based, returns tuple[int, int]
+            - If input is float-based, returns tuple[float, float]
+
+    Raises:
+        ValueError: If both 'low' and 'bias' are provided.
+        TypeError: If 'param' is neither a scalar nor a sequence of 2 elements.
+
+    Examples:
+        >>> to_tuple(5)
+        (-5, 5)
+        >>> to_tuple(5.0)
+        (-5.0, 5.0)
+        >>> to_tuple((1, 10))
+        (1, 10)
+        >>> to_tuple(5, low=3)
+        (3, 5)
+        >>> to_tuple(5, bias=1)
+        (-4, 6)
+
+    Notes:
+        - When 'param' is a single value and 'low' is not provided, the function creates a symmetric range around zero.
+        - The function preserves the type (int or float) of the input in the output.
+        - If a sequence is provided, it must contain exactly 2 elements.
+
+    """
+    validate_args(low, bias)
+
+    if isinstance(param, Sequence):
+        min_val, max_val = process_sequence(param)
+    elif isinstance(param, Real):
+        min_val, max_val = process_scalar(param, cast("Real", low))
+    else:
+        raise TypeError("Argument 'param' must be either a scalar or a sequence of 2 elements.")
+
+    if bias is not None:
+        min_val, max_val = apply_bias(min_val, max_val, bias)
+
+    return ensure_int_output(min_val, max_val, param if isinstance(param, (int, float)) else min_val)
